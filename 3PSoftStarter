@@ -1,0 +1,197 @@
+// 3-phase code based on the working single-phase version
+// ZCD interrupt pins: 18, 19, 20
+// Gate output pins: 22 to 27
+// Use a microcontroller that has 3 interrupt pins
+
+// ZCD input pins
+const int zcdPinA = 18;   // Phase A ZCD input from LM339
+const int zcdPinB = 19;   // Phase B ZCD input from LM339
+const int zcdPinC = 20;   // Phase C ZCD input from LM339
+
+// Gate output pins
+const int posGateA = 22;  // Phase A positive half cycle output
+const int negGateA = 23;  // Phase A negative half cycle output
+const int posGateB = 24;  // Phase B positive half cycle output
+const int negGateB = 25;  // Phase B negative half cycle output
+const int posGateC = 26;  // Phase C positive half cycle output
+const int negGateC = 27;  // Phase C negative half cycle output
+
+// AC settings
+const float lineFreq = 60.0;
+const unsigned long halfCycleUs = (unsigned long)(1000000.0 / (2.0 * lineFreq)); // 8333 us at 60 Hz
+
+// Gate pulse width
+const unsigned long gatePulseWidthUs = 500;   // 500 us pulse
+
+// Soft start ramp settings
+float startAngle = 160.0;
+float endAngle   = 5.0;
+unsigned long rampDurationMs = 3000;
+unsigned long rampStepMs     = 100;
+
+// Current firing angles
+float firingAngleDeg = 160.0;
+
+// Enable/disable each phase
+bool enablePhaseA = true;
+bool enablePhaseB = true;
+bool enablePhaseC = true;
+
+// Ramp control flags
+bool rampEnabled  = true;
+bool rampFinished = false;
+unsigned long rampStartTime = 0;
+unsigned long lastRampUpdate = 0;
+
+// AC presence detection for each phase
+volatile unsigned long lastValidZcdTimeMsA = 0;
+volatile unsigned long lastValidZcdTimeMsB = 0;
+volatile unsigned long lastValidZcdTimeMsC = 0;
+const unsigned long acLossTimeoutMs = 100;
+
+// Filtered AC detection
+bool acConfirmedPresent = false;
+bool rawAcPrev = false;
+unsigned long rawAcChangeTimeMs = 0;
+const unsigned long acOffConfirmMs = 300;
+const unsigned long acOnConfirmMs  = 50;
+
+// Zero-cross debounce / lockout
+const unsigned long zcdLockoutUs = 1000;
+volatile unsigned long lastZcdInterruptTimeA = 0;
+volatile unsigned long lastZcdInterruptTimeB = 0;
+volatile unsigned long lastZcdInterruptTimeC = 0;
+
+// Phase A flags
+volatile bool posEdgeDetectedA = false;
+volatile bool negEdgeDetectedA = false;
+volatile unsigned long posZcTimeA = 0;
+volatile unsigned long negZcTimeA = 0;
+
+// Phase A scheduling
+bool posPulsePendingA = false;
+bool posPulseActiveA  = false;
+unsigned long posFireTimeA = 0;
+unsigned long posPulseStartA = 0;
+
+bool negPulsePendingA = false;
+bool negPulseActiveA  = false;
+unsigned long negFireTimeA = 0;
+unsigned long negPulseStartA = 0;
+
+// Phase B flags
+volatile bool posEdgeDetectedB = false;
+volatile bool negEdgeDetectedB = false;
+volatile unsigned long posZcTimeB = 0;
+volatile unsigned long negZcTimeB = 0;
+
+// Phase B scheduling
+bool posPulsePendingB = false;
+bool posPulseActiveB  = false;
+unsigned long posFireTimeB = 0;
+unsigned long posPulseStartB = 0;
+
+bool negPulsePendingB = false;
+bool negPulseActiveB  = false;
+unsigned long negFireTimeB = 0;
+unsigned long negPulseStartB = 0;
+
+// Phase C flags
+volatile bool posEdgeDetectedC = false;
+volatile bool negEdgeDetectedC = false;
+volatile unsigned long posZcTimeC = 0;
+volatile unsigned long negZcTimeC = 0;
+
+// Phase C scheduling
+bool posPulsePendingC = false;
+bool posPulseActiveC  = false;
+unsigned long posFireTimeC = 0;
+unsigned long posPulseStartC = 0;
+
+bool negPulsePendingC = false;
+bool negPulseActiveC  = false;
+unsigned long negFireTimeC = 0;
+unsigned long negPulseStartC = 0;
+
+void setup() {
+   pinMode(zcdPinA, INPUT_PULLUP);
+   pinMode(zcdPinB, INPUT_PULLUP);
+   pinMode(zcdPinC, INPUT_PULLUP);
+
+   pinMode(posGateA, OUTPUT);
+   pinMode(negGateA, OUTPUT);
+   pinMode(posGateB, OUTPUT);
+   pinMode(negGateB, OUTPUT);
+   pinMode(posGateC, OUTPUT);
+   pinMode(negGateC, OUTPUT);
+
+   digitalWrite(posGateA, LOW);
+   digitalWrite(negGateA, LOW);
+   digitalWrite(posGateB, LOW);
+   digitalWrite(negGateB, LOW);
+   digitalWrite(posGateC, LOW);
+   digitalWrite(negGateC, LOW);
+
+   rampStartTime = millis();
+   lastRampUpdate = millis();
+
+   attachInterrupt(digitalPinToInterrupt(zcdPinA), zcdISRA, CHANGE);
+   attachInterrupt(digitalPinToInterrupt(zcdPinB), zcdISRB, CHANGE);
+   attachInterrupt(digitalPinToInterrupt(zcdPinC), zcdISRC, CHANGE);
+}
+
+void loop() {
+   unsigned long nowMs = millis();
+
+   bool rawAcPresentA = (nowMs - lastValidZcdTimeMsA) < acLossTimeoutMs;
+   bool rawAcPresentB = (nowMs - lastValidZcdTimeMsB) < acLossTimeoutMs;
+   bool rawAcPresentC = (nowMs - lastValidZcdTimeMsC) < acLossTimeoutMs;
+
+   bool rawAcPresent = rawAcPresentA && rawAcPresentB && rawAcPresentC;
+
+   if (rawAcPresent != rawAcPrev) {
+      rawAcPrev = rawAcPresent;
+      rawAcChangeTimeMs = nowMs;
+   }
+
+   if (!acConfirmedPresent && rawAcPresent) {
+      if (nowMs - rawAcChangeTimeMs >= acOnConfirmMs) {
+         acConfirmedPresent = true;
+         rampFinished = false;
+         rampStartTime = nowMs;
+         lastRampUpdate = nowMs;
+         firingAngleDeg = startAngle;
+      }
+   }
+
+   if (acConfirmedPresent && !rawAcPresent) {
+      if (nowMs - rawAcChangeTimeMs >= acOffConfirmMs) {
+         acConfirmedPresent = false;
+         clearAllPulses();
+      }
+   }
+
+   if (acConfirmedPresent && rampEnabled && !rampFinished) {
+      if (nowMs - lastRampUpdate >= rampStepMs) {
+         lastRampUpdate = nowMs;
+         float progress = (float)(nowMs - rampStartTime) / rampDurationMs;
+
+         if (progress >= 1.0) {
+            progress = 1.0;
+            rampFinished = true;
+         }
+
+         firingAngleDeg = startAngle - (startAngle - endAngle) * progress;
+      }
+   }
+
+   float angle = firingAngleDeg;
+   if (angle < 0.0) angle = 0.0;
+   if (angle > 179.0) angle = 179.0;
+
+   unsigned long delayUs = (unsigned long)((angle / 180.0) * halfCycleUs);
+
+   handlePhaseA(delayUs);
+   handlePhaseB(delayUs);
+   handlePhaseC(delayUs);
+}
